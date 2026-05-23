@@ -1,0 +1,35 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data files (too large for Git)
+data/raw/
+data/processed/
+*.parquet
+*.h5
+*.hdf5
+
+# Environment variables (API keys)
+.env
+*.env
+
+# VSCode
+.vscode/
+!.vscode/settings.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
