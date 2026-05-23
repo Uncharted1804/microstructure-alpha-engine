@@ -12,11 +12,10 @@ realistic transaction costs.
 
 ## Why this is unusual
 
-Most student quant projects backtest on daily OHLCV data. This operates at the 
+Most quant projects backtest on daily OHLCV data. This operates at the 
 **millisecond tick level** — the same data resolution that prop desks at Citadel 
-Securities and Jane Street use. Saying "I modelled the LOB and estimated Kyle's 
-lambda from crypto order flow" immediately signals you understand real market 
-microstructure.
+Securities and Jane Street use. I made this project to show the depth of understanding I 
+have of real market mocrostructure. I modelled the LOB and estimated Kyle's lambda from crypto order flow.
 
 ## Pipeline
 
