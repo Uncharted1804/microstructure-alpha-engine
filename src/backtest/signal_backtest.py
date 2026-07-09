@@ -1,10 +1,16 @@
 """
 TC-adjusted OFI signal backtest.
 
+PnL and TC are expressed in BASIS POINTS of the entry price.
+This makes the signal strength directly comparable to the cost
+regardless of the absolute price level of the asset.
+
+8 bps to break even (4 bps taker fee each way + spread).
+OFI signal needs to generate > 8 bps per trade to be profitable.
+
 Transaction costs applied:
-  1. Taker fee: 0.04% per side on Binance Futures (4 bps) — round trip = 8 bps
-  2. Spread cost: you cross the full spread on a round trip
-  3. Kyle impact (optional): λ * quantity
+  1. Taker fee: 4 bps per side = 8 bps round trip
+  2. Spread cost: spread / mid_price * 10000 bps
 """
 
 import numpy as np
@@ -12,33 +18,29 @@ import pandas as pd
 from loguru import logger
 
 
-def compute_transaction_cost(
+def compute_transaction_cost_bps(
     mid_price: float,
     spread: float,
-    quantity: float = 1.0,
     taker_fee_bps: float = 4.0,
-    lambda_impact: float = 0.0,
 ) -> float:
     """
-    Total round-trip transaction cost in price units.
+    Total round-trip transaction cost in BASIS POINTS.
 
-    fee_cost    = (bps/10000) * price * 2   (entry + exit)
-    spread_cost = spread                     (full spread for round trip)
-    impact_cost = lambda * quantity * 2      (round trip)
+    fee_cost_bps    = taker_fee_bps * 2   (entry + exit)
+    spread_cost_bps = (spread / mid_price) * 10000
     """
-    fee_cost = (taker_fee_bps / 10_000) * mid_price * 2
-    spread_cost = spread
-    impact_cost = lambda_impact * quantity * 2
-    return fee_cost + spread_cost + impact_cost
+    fee_cost_bps = taker_fee_bps * 2
+    spread_cost_bps = (spread / mid_price) * 10_000
+    return fee_cost_bps + spread_cost_bps
 
 
 class OFIBacktester:
     """
-    Simple OFI signal backtest — no overlapping trades.
+    OFI signal backtest. All PnL figures are in basis points.
 
     entry_threshold : OFI z-score magnitude to enter a trade
     holding_period  : how many snapshots to hold before exiting
-    taker_fee_bps   : exchange fee in basis points (default 4 = 0.04%)
+    taker_fee_bps   : exchange fee per side in basis points (default 4)
     """
 
     def __init__(
@@ -46,12 +48,10 @@ class OFIBacktester:
         entry_threshold: float = 1.5,
         holding_period: int = 10,
         taker_fee_bps: float = 4.0,
-        kyle_lambda: float = 0.0,
     ):
         self.entry_threshold = entry_threshold
         self.holding_period = holding_period
         self.taker_fee_bps = taker_fee_bps
-        self.kyle_lambda = kyle_lambda
 
     def generate_signals(self, df: pd.DataFrame) -> pd.Series:
         """Return +1 (long), -1 (short), 0 (no trade) for each row."""
@@ -67,10 +67,13 @@ class OFIBacktester:
 
     def run(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Run the backtest. Returns a DataFrame of trades with columns:
-          entry_idx, exit_idx, direction, entry_price, exit_price,
-          tc_cost, gross_pnl, net_pnl, profitable,
-          cumulative_gross_pnl, cumulative_net_pnl
+        Run the backtest. All PnL in basis points.
+
+        Returns DataFrame with columns:
+          entry_idx, exit_idx, direction,
+          entry_price, exit_price,
+          gross_pnl_bps, tc_cost_bps, net_pnl_bps,
+          profitable, cumulative columns
         """
         df = df.reset_index(drop=True).copy()
         signals = self.generate_signals(df)
@@ -81,7 +84,6 @@ class OFIBacktester:
         for i in range(len(df) - self.holding_period - 1):
             if i <= last_exit:
                 continue
-
             if signals.iloc[i] == 0:
                 continue
 
@@ -93,15 +95,15 @@ class OFIBacktester:
                 df["spread"].iloc[i] if "spread" in df.columns else entry_price * 0.0001
             )
 
-            tc = compute_transaction_cost(
-                mid_price=entry_price,
-                spread=spread,
-                taker_fee_bps=self.taker_fee_bps,
-                lambda_impact=self.kyle_lambda,
-            )
+            # PnL in basis points
+            price_move_bps = ((exit_price - entry_price) / entry_price) * 10_000
+            gross_pnl_bps = price_move_bps * direction
 
-            gross_pnl = (exit_price - entry_price) * direction
-            net_pnl = gross_pnl - tc
+            # TC in basis points
+            tc_bps = compute_transaction_cost_bps(
+                entry_price, spread, self.taker_fee_bps
+            )
+            net_bps = gross_pnl_bps - tc_bps
 
             trades.append(
                 {
@@ -114,10 +116,10 @@ class OFIBacktester:
                     "entry_price": entry_price,
                     "exit_price": exit_price,
                     "spread": spread,
-                    "tc_cost": tc,
-                    "gross_pnl": gross_pnl,
-                    "net_pnl": net_pnl,
-                    "profitable": net_pnl > 0,
+                    "tc_cost_bps": tc_bps,
+                    "gross_pnl_bps": gross_pnl_bps,
+                    "net_pnl_bps": net_bps,
+                    "profitable": net_bps > 0,
                 }
             )
 
@@ -128,31 +130,37 @@ class OFIBacktester:
             return pd.DataFrame()
 
         results = pd.DataFrame(trades)
-        results["cumulative_gross_pnl"] = results["gross_pnl"].cumsum()
-        results["cumulative_net_pnl"] = results["net_pnl"].cumsum()
-        results["cumulative_tc"] = results["tc_cost"].cumsum()
+        results["cumulative_gross_bps"] = results["gross_pnl_bps"].cumsum()
+        results["cumulative_net_bps"] = results["net_pnl_bps"].cumsum()
+        results["cumulative_tc_bps"] = results["tc_cost_bps"].cumsum()
 
         self._print_summary(results)
         return results
 
     def _print_summary(self, r: pd.DataFrame) -> None:
-        gross = r["gross_pnl"].sum()
-        tc = r["tc_cost"].sum()
-        net = r["net_pnl"].sum()
+        gross = r["gross_pnl_bps"].sum()
+        tc = r["tc_cost_bps"].sum()
+        net = r["net_pnl_bps"].sum()
         sharpe = (
-            r["net_pnl"].mean() / r["net_pnl"].std() if r["net_pnl"].std() > 0 else 0
+            r["net_pnl_bps"].mean() / r["net_pnl_bps"].std()
+            if r["net_pnl_bps"].std() > 0
+            else 0
         )
+        tc_drag = tc / abs(gross) * 100 if gross != 0 else float("inf")
+
         logger.info(
             f"\n{'=' * 45}"
-            f"\nBACKTEST RESULTS"
+            f"\nBACKTEST RESULTS  (all figures in basis points)"
             f"\n{'=' * 45}"
-            f"\n  Trades:       {len(r)}"
-            f"\n  Win rate:     {r['profitable'].mean():.1%}"
-            f"\n  Gross PnL:    {gross:.6f}"
-            f"\n  Total TC:     {tc:.6f}  ({tc / abs(gross) * 100:.1f}% of gross)"
-            f"\n  Net PnL:      {net:.6f}"
-            f"\n  Sharpe:       {sharpe:.2f}"
-            f"\n  Survived TC:  {'YES ✓' if net > 0 else 'NO ✗'}"
+            f"\n  Trades:          {len(r)}"
+            f"\n  Win rate:        {r['profitable'].mean():.1%}"
+            f"\n  Gross PnL:       {gross:.2f} bps"
+            f"\n  Total TC:        {tc:.2f} bps  ({tc_drag:.1f}% of gross)"
+            f"\n  Net PnL:         {net:.2f} bps"
+            f"\n  Mean per trade:  {r['net_pnl_bps'].mean():.2f} bps"
+            f"\n  Break-even TC:   {r['tc_cost_bps'].mean():.2f} bps/trade"
+            f"\n  Sharpe:          {sharpe:.2f}"
+            f"\n  Survived TC:     {'YES ✓' if net > 0 else 'NO ✗'}"
             f"\n{'=' * 45}"
         )
 
@@ -160,12 +168,13 @@ class OFIBacktester:
 def parameter_sweep(
     df: pd.DataFrame,
     thresholds: list = [0.5, 1.0, 1.5, 2.0, 2.5],
-    holding_periods: list = [5, 10, 20, 30, 50],
+    holding_periods: list = [5, 10, 20, 50, 100],
     taker_fee_bps: float = 4.0,
 ) -> pd.DataFrame:
     """
     Grid search over entry thresholds and holding periods.
     Returns a DataFrame you can pivot into a heatmap.
+    All PnL figures in basis points.
     """
     results = []
 
@@ -180,16 +189,17 @@ def parameter_sweep(
                         "threshold": threshold,
                         "holding_period": holding,
                         "n_trades": 0,
-                        "net_pnl": 0,
+                        "net_pnl_bps": np.nan,
                         "win_rate": np.nan,
                         "sharpe": np.nan,
+                        "mean_net_bps": np.nan,
                     }
                 )
                 continue
 
             sharpe = (
-                trades["net_pnl"].mean() / trades["net_pnl"].std()
-                if trades["net_pnl"].std() > 0
+                trades["net_pnl_bps"].mean() / trades["net_pnl_bps"].std()
+                if trades["net_pnl_bps"].std() > 0
                 else 0
             )
             results.append(
@@ -197,18 +207,23 @@ def parameter_sweep(
                     "threshold": threshold,
                     "holding_period": holding,
                     "n_trades": len(trades),
-                    "net_pnl": trades["net_pnl"].sum(),
+                    "net_pnl_bps": trades["net_pnl_bps"].sum(),
                     "win_rate": trades["profitable"].mean(),
                     "sharpe": sharpe,
+                    "mean_net_bps": trades["net_pnl_bps"].mean(),
                 }
             )
 
     sweep_df = pd.DataFrame(results)
-    best = sweep_df.loc[sweep_df["sharpe"].idxmax()]
-    logger.info(
-        f"Best: threshold={best['threshold']}, "
-        f"holding={best['holding_period']}, "
-        f"Sharpe={best['sharpe']:.2f}, "
-        f"trades={best['n_trades']}"
-    )
+    valid = sweep_df.dropna(subset=["sharpe"])
+
+    if not valid.empty:
+        best = valid.loc[valid["sharpe"].idxmax()]
+        logger.info(
+            f"Best params: threshold={best['threshold']}, "
+            f"holding={best['holding_period']}, "
+            f"Sharpe={best['sharpe']:.2f}, "
+            f"mean net={best['mean_net_bps']:.2f} bps/trade"
+        )
+
     return sweep_df
